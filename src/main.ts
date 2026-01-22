@@ -1,25 +1,25 @@
-import { App, Plugin, PluginSettingTab, Setting, Editor, EditorPosition } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Editor } from 'obsidian';
 
 // Interface for link data
 interface WikiLink {
-  fullText: string;        // Complete match including brackets
-  hasTransclusion: boolean; // Whether ! prefix exists
-  path: string;             // Path between brackets
-  startLine: number;        // Editor line number
-  startCh: number;          // Character position in line
-  endCh: number;            // End character position
+  fullText: string;
+  hasTransclusion: boolean;
+  path: string;
+  startLine: number;
+  startCh: number;
+  endCh: number;
 }
 
 export default class TransclusionTogglerPlugin extends Plugin {
   async onload() {
-    console.log('Transclusion Toggler plugin loaded');
+    console.debug('Transclusion Toggler plugin loaded');
 
-    // Command 1: Toggle transclusion on current link
+    // Command 1: Toggle transclusion - selection or current link or nearest
     this.addCommand({
       id: 'toggle-current-link',
-      name: 'Toggle transclusion on current wikilink',
+      name: 'Toggle transclusion on current/selected wikilinks',
       editorCallback: (editor: Editor) => {
-        this.toggleCurrentLink(editor);
+        this.toggleCurrentOrSelected(editor);
       }
     });
 
@@ -32,76 +32,184 @@ export default class TransclusionTogglerPlugin extends Plugin {
       }
     });
 
-    // Optional: Add settings tab if needed for future configuration
     this.addSettingTab(new TransclusionTogglerSettingTab(this.app, this));
   }
 
   onunload() {
-    console.log('Transclusion Toggler plugin unloaded');
+    console.debug('Transclusion Toggler plugin unloaded');
   }
 
-  // CORE METHOD 1: Toggle link under cursor
-  toggleCurrentLink(editor: Editor): void {
-    const cursor = editor.getCursor();
-    const line = editor.getLine(cursor.line);
+  // ===== CORE METHOD 1: Toggle with selection awareness =====
+  toggleCurrentOrSelected(editor: Editor): void {
+    const selection = editor.getSelection();
 
-    // Find wikilink at cursor position
-    const link = this.findLinkAtCursor(line, cursor.ch);
-
-    if (!link) {
-      // Show visual feedback - optional toast notification
-      console.log('No wikilink found at cursor position');
+    // CASE 1: User has text selected
+    if (selection.length > 0) {
+      this.toggleLinksInSelection(editor);
       return;
     }
 
-    // Toggle the link
-    const toggled = this.toggleLink(link);
+    // CASE 2 & 3: No selection - check cursor position
+    const cursor = editor.getCursor();
+    const line = editor.getLine(cursor.line);
+    const link = this.findLinkAtCursor(line, cursor.ch);
 
-    // Replace in editor
-    editor.replaceRange(toggled,
-      { line: cursor.line, ch: link.startCh },
-      { line: cursor.line, ch: link.endCh }
-    );
+    if (link) {
+      // CASE 2: Cursor is on a wikilink
+      const toggled = this.toggleLink(link);
+      editor.replaceRange(
+        toggled,
+        { line: cursor.line, ch: link.startCh },
+        { line: cursor.line, ch: link.endCh }
+      );
+    } else {
+      // CASE 3: Cursor not on link - find nearest wikilink
+      const nearestLink = this.findNearestLink(editor, cursor.line, cursor.ch);
+      if (nearestLink) {
+        const toggled = this.toggleLink(nearestLink.link);
+        editor.replaceRange(
+          toggled,
+          { line: nearestLink.line, ch: nearestLink.link.startCh },
+          { line: nearestLink.line, ch: nearestLink.link.endCh }
+        );
+      } else {
+        console.debug('No wikilink found at cursor or nearby');
+      }
+    }
   }
 
-  // CORE METHOD 2: Toggle all links in document
+  // ===== HELPER: Toggle all links within selection =====
+  toggleLinksInSelection(editor: Editor): void {
+    const anchor = editor.getCursor('anchor');
+    const head = editor.getCursor('head');
+
+    // Normalize so start < end
+    const startLine = Math.min(anchor.line, head.line);
+    const endLine = Math.max(anchor.line, head.line);
+
+    const startCh = anchor.line < head.line ? anchor.ch : Math.min(anchor.ch, head.ch);
+    const endCh = anchor.line < head.line ? Number.MAX_SAFE_INTEGER : Math.max(anchor.ch, head.ch);
+
+    const fullText = editor.getValue();
+    const lines = fullText.split('\n');
+    let replacements: Array<{ from: EditorPos; to: EditorPos; text: string }> = [];
+
+    lines.forEach((line, lineIndex) => {
+      // Check if this line is within selection range
+      if (lineIndex < startLine || lineIndex > endLine) {
+        return;
+      }
+
+      const links = this.findAllLinksInLine(line);
+
+      // Filter links that fall within selection bounds
+      const selectedLinks = links.filter((link) => {
+        if (lineIndex === startLine && lineIndex === endLine) {
+          return link.startCh >= startCh && link.endCh <= endCh;
+        } else if (lineIndex === startLine) {
+          return link.startCh >= startCh;
+        } else if (lineIndex === endLine) {
+          return link.endCh <= endCh;
+        }
+        return true; // Entire line is in selection
+      });
+
+      // Process in reverse order to avoid position shifting
+      selectedLinks.reverse().forEach((link) => {
+        const toggled = this.toggleLink(link);
+        replacements.push({
+          from: { line: lineIndex, ch: link.startCh },
+          to: { line: lineIndex, ch: link.endCh },
+          text: toggled
+        });
+      });
+    });
+
+    // Apply replacements (already in reverse order per line)
+    replacements.forEach((replacement) => {
+      editor.replaceRange(replacement.text, replacement.from, replacement.to);
+    });
+  }
+
+  // ===== HELPER: Find nearest wikilink from cursor =====
+  findNearestLink(editor: Editor, cursorLine: number, cursorCh: number): { line: number; link: WikiLink } | null {
+    const fullText = editor.getValue();
+    const lines = fullText.split('\n');
+
+    // First, search forward from cursor line
+    for (let i = cursorLine; i < lines.length; i++) {
+      const line = lines[i];
+      if (line === undefined) continue;
+      const links = this.findAllLinksInLine(line);
+
+      for (const link of links) {
+        if (i === cursorLine) {
+          // On cursor line: only consider links after cursor
+          if (link.startCh >= cursorCh) {
+            return { line: i, link };
+          }
+        } else {
+          // After cursor line: take first link
+          return { line: i, link };
+        }
+      }
+    }
+
+    // Search backward from cursor line
+    for (let i = cursorLine; i >= 0; i--) {
+      const line = lines[i];
+      if (line === undefined) continue;
+      const links = this.findAllLinksInLine(line);
+
+      for (let j = links.length - 1; j >= 0; j--) {
+        const link = links[j];
+        if (!link) continue;
+        if (i === cursorLine) {
+          // On cursor line: only consider links before cursor
+          if (link.endCh <= cursorCh) {
+            return { line: i, link };
+          }
+        } else {
+          // Before cursor line: take last link
+          return { line: i, link };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  // ===== CORE METHOD 2: Toggle all links in document =====
   toggleAllLinks(editor: Editor): void {
     const fullText = editor.getValue();
-
-    // Split by lines to track line numbers
     const lines = fullText.split('\n');
 
     const newLines = lines.map((line) => {
       const matches = this.findAllLinksInLine(line);
-
-      // Sort matches in reverse to avoid position shifting during replacement within the line
       matches.reverse();
 
       let newLine = line;
       matches.forEach((link) => {
         const toggled = this.toggleLink(link);
-        newLine = newLine.substring(0, link.startCh) +
-                      toggled +
-                      newLine.substring(link.endCh);
+        newLine = newLine.substring(0, link.startCh) + toggled + newLine.substring(link.endCh);
       });
+
       return newLine;
     });
 
-    // Replace entire document content
     const lastLine = editor.lastLine();
     const lastCh = editor.getLine(lastLine).length;
-
     const modifiedText = newLines.join('\n');
 
-    editor.replaceRange(modifiedText,
+    editor.replaceRange(
+      modifiedText,
       { line: 0, ch: 0 },
       { line: lastLine, ch: lastCh }
     );
   }
 
-  // HELPER: Find link under cursor
+  // ===== HELPER: Find link under cursor =====
   private findLinkAtCursor(line: string, cursorCh: number): WikiLink | null {
-    // Regex pattern for wikilink
     const wikiLinkPattern = /!?\[\[[^\]]+\]\]/g;
     let match;
 
@@ -109,7 +217,6 @@ export default class TransclusionTogglerPlugin extends Plugin {
       const startCh = match.index;
       const endCh = match.index + match[0].length;
 
-      // Check if cursor is within this link
       if (cursorCh >= startCh && cursorCh <= endCh) {
         return this.parseWikiLink(match[0], startCh, endCh);
       }
@@ -118,7 +225,7 @@ export default class TransclusionTogglerPlugin extends Plugin {
     return null;
   }
 
-  // HELPER: Find all links in a single line
+  // ===== HELPER: Find all links in a single line =====
   private findAllLinksInLine(line: string): WikiLink[] {
     const wikiLinkPattern = /!?\[\[[^\]]+\]\]/g;
     const links: WikiLink[] = [];
@@ -133,33 +240,32 @@ export default class TransclusionTogglerPlugin extends Plugin {
     return links;
   }
 
-  // HELPER: Parse wikilink structure
+  // ===== HELPER: Parse wikilink structure =====
   private parseWikiLink(fullText: string, startCh: number, endCh: number): WikiLink {
     const hasTransclusion = fullText.startsWith('!');
-    const path = fullText.slice(hasTransclusion ? 3 : 2, -2); // Extract path between [[ ]]
+    const path = fullText.slice(hasTransclusion ? 3 : 2, -2);
 
     return {
       fullText,
       hasTransclusion,
       path,
-      startLine: 0, // Set dynamically in context
+      startLine: 0,
       startCh,
       endCh
     };
   }
 
-  // CORE TRANSFORMER: Toggle the link
+  // ===== CORE TRANSFORMER: Toggle the link =====
   private toggleLink(link: WikiLink): string {
     if (link.hasTransclusion) {
-      // Remove ! prefix
       return `[[${link.path}]]`;
     } else {
-      // Add ! prefix
       return `![[${link.path}]]`;
     }
   }
 }
 
+// ===== SETTINGS TAB =====
 class TransclusionTogglerSettingTab extends PluginSettingTab {
   plugin: TransclusionTogglerPlugin;
 
@@ -173,7 +279,14 @@ class TransclusionTogglerSettingTab extends PluginSettingTab {
     containerEl.empty();
 
     new Setting(containerEl)
-      .setName('Feature Status')
-      .setDesc('Transclusion Toggler is active and ready to use');
+      .setName('Feature status')
+      // eslint-disable-next-line obsidianmd/ui/sentence-case
+      .setDesc('Transclusion Toggler is active with selection-aware toggling');
   }
+}
+
+// Type definition for editor positions in replacements
+interface EditorPos {
+  line: number;
+  ch: number;
 }
