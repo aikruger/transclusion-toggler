@@ -4,7 +4,7 @@ Transclusion Toggler is an Obsidian plugin that allows you to quickly toggle the
 
 ## Features
 
-- **Toggle Current Link**: Add or remove the `!` prefix from the wikilink under your cursor.
+- **Toggle Current Link**: Add or remove the `!` prefix from the wikilink under your cursor or wikilink(s) in selection.
 - **Toggle All Links**: Add or remove the `!` prefix from all wikilinks in the current note.
 
 ## Usage
@@ -13,7 +13,7 @@ Transclusion Toggler is an Obsidian plugin that allows you to quickly toggle the
 
 This plugin provides two commands:
 
-1.  **Toggle transclusion on current wikilink**:
+1.  **Toggle transclusion on current selected wikilink(s)**:
     -   Place your cursor anywhere inside a wikilink (e.g., `[[My Note]]` or `![[My Note]]`).
     -   Run the command to toggle the `!` prefix.
     -   `[[My Note]]` -> `![[My Note]]`
